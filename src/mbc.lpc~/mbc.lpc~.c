@@ -36,7 +36,7 @@ typedef struct _lpc
 	double 						l_G;
 	double**					l_A;
 	double 						l_x1;				//last samples of pre-emphasis filter
-	float 						l_b1;				//pre-emph coefficient
+	double 						l_b1;				//pre-emph coefficient
 	int 						l_order;			//predictor order
 	int 						l_order_max;		//max order according to fs = order * frame_rate
 	int 						l_preemph;			//pre-epmhasis filter on/off
@@ -63,6 +63,12 @@ void lpc_assist(t_lpc *x, void *b, long m, long a, char *s);
 void lpc_dsp(t_lpc *x, t_signal **sp, short *count);
 t_int *lpc_perform(t_int *w);
 
+void lpc_dsp64(t_lpc *x, t_object *dsp64, short *count, double samplerate,
+                   long maxvectorsize, long flags);
+void lpc_perform64(t_lpc *x, t_object *dsp64, double **ins, long numins,
+                           double **outs, long numouts, long sampleframes, long flags, void *userparam);
+
+
 void lpc_order(t_lpc *x, int n);
 void lpc_preemph(t_lpc *x, int n);
 void lpc_init(t_lpc *x);
@@ -74,7 +80,7 @@ void lpc_bartlett(t_lpc *x);
 void *lpc_class;
 
 
-int main(void)
+int C74_EXPORT main(void)
 {	
 	// object initialization, note the use of dsp_free for the freemethod, which is required
 	// unless you need to free allocated memory, in which case you should call dsp_free from
@@ -95,6 +101,7 @@ int main(void)
 	c = class_new("mbc.lpc~", (method)lpc_new, (method)lpc_free, (long)sizeof(t_lpc), 0L, A_DEFLONG, A_DEFLONG, A_DEFLONG, 0); //arglist: order, framerate, preemph
 	
 	class_addmethod(c, (method)lpc_dsp, "dsp", A_CANT, 0);
+    class_addmethod(c, (method)lpc_dsp64, "dsp64", A_CANT, 0);
 	class_addmethod(c, (method)lpc_order,"order",A_DEFLONG,0);
 	class_addmethod(c, (method)lpc_preemph,"preemph",A_DEFLONG,0);
 	class_addmethod(c, (method)lpc_assist,"assist",A_CANT,0);
@@ -300,6 +307,201 @@ t_int *lpc_perform(t_int *w)
 	return (w+9);
 }
 
+
+void lpc_perform64(t_lpc *x, t_object *dsp64, double **ins, long numins,
+                       double **outs, long numouts, long sampleframes, long flags, void *userparam)
+{
+    t_double *in = ins[0];
+    t_double *out_error = outs[0];
+    t_double *out_gain = outs[1];
+    t_double *out_coeff = outs[2];
+    t_double *out_parcor = outs[3];
+    t_double *out_index = outs[4];
+    int n = (int)sampleframes;
+    int p = x->l_order;
+    int length = x->l_frame_size;
+    int log2nfft = NLOG2(length+p+1);
+    int nfft = POW2(log2nfft);
+    int nfftO2 = nfft/2;
+    float recipn = 1.0/nfft;
+    int inframeidx = x->l_inframe_idx;
+    int outframeidx = x->l_outframe_idx;
+    
+    int i, j, i1, ji;
+    int in_idx = 0, out_idx = 0;
+    double val;
+    float scale;
+    
+    if (x->l_preemph)
+    {
+        while (n--)
+        {
+            val = in[in_idx];
+            in[in_idx] = val + x->l_b1 * x->l_x1;
+            x->l_x1 = val;
+            in_idx++;
+        }
+        n = (int)sampleframes;
+        in_idx = 0;
+    }
+    
+    while (n--)
+    {
+        if (inframeidx < length) {
+            //copy input into frame buff
+            x->l_frame_buff[inframeidx] = in[in_idx];
+            
+            out_gain[out_idx] = x->l_G;
+            out_error[out_idx] = x->l_outError_buff[outframeidx]; //for now
+            if (outframeidx < x->l_order) {
+                out_coeff[out_idx] = x->l_outCoeff_buff[outframeidx];
+                out_parcor[out_idx] = x->l_outParcor_buff[outframeidx];
+                out_index[out_idx] = outframeidx + 1;
+            } else {
+                out_coeff[out_idx] = 0.0;
+                out_parcor[out_idx] = 0.0;
+                out_index[out_idx] = 0;
+            }
+            
+            inframeidx++;
+            in_idx++;
+            outframeidx++;
+            out_idx++;
+        } else {
+            //perform durbin-levinson - for right now, just count to the order---------------
+            //clear memory, is this necessary?
+            for (i=0; i < p+1; i++){
+                x->l_R[i] = 0.0;
+                x->l_W[i] = 0.0;
+                x->l_E[i] = 0.0;
+                x->l_K[i] = 0.0;
+            }
+            for(i=0; i<=p; i++) {
+                for(j=0; j < p; j++) x->l_A[i][j] = 0.0;
+            }
+            //window frame buff
+            vDSP_vmul(x->l_frame_buff, 1, x->l_win, 1, x->l_winframe_buff, 1, length);
+#ifdef DEBUG
+            for(i=0;i<length;i++)cpost("\nwinframe(%d) = %g;",i+1,x->l_winframe_buff[i]);
+#endif
+            
+            //create r from auto correlation
+            if ((2*nfft*log2(nfft)+nfft) > length*p) { //NOTE: change this to update only when order is changed!
+                //time domain method
+                for(i=0; i < p+1; i++) vDSP_dotpr(x->l_winframe_buff,1,x->l_winframe_buff+i,1,x->l_R+i,length-i);
+            } else {
+                //frequency domain method
+                // zero pad
+                vDSP_vclr(x->l_winframe_buff+length,1,nfft-length);
+                //convert to split complex vector
+                vDSP_ctoz( ( DSPComplex * ) x->l_winframe_buff, 2, &x->l_fftSplitTemp, 1, nfftO2);
+                //perform forward in place fft
+                vDSP_fft_zrip(x->l_fftsetup, &x->l_fftSplitTemp, 1, log2nfft, FFT_FORWARD);
+                //scaling
+                scale = 0.5;
+                vDSP_vsmul(x->l_fftSplitTemp.realp,1,&scale,x->l_fftSplitTemp.realp,1,nfftO2);
+                vDSP_vsmul(x->l_fftSplitTemp.imagp,1,&scale,x->l_fftSplitTemp.imagp,1,nfftO2);
+                //compute PSD
+                vDSP_zvmags(&x->l_fftSplitTemp,1,x->l_fftSplitTemp.realp,1,nfftO2);
+                //clear imaginary part
+                vDSP_vclr(x->l_fftSplitTemp.imagp,1,nfftO2);
+                //perform inverse in place fft
+                vDSP_fft_zrip(x->l_fftsetup, &x->l_fftSplitTemp, 1, log2nfft, FFT_INVERSE);
+                //scaling
+                vDSP_vsmul(x->l_fftSplitTemp.realp,1,&recipn,x->l_fftSplitTemp.realp,1,nfftO2);
+                vDSP_vsmul(x->l_fftSplitTemp.imagp,1,&recipn,x->l_fftSplitTemp.imagp,1,nfftO2);
+                //convert back to real number vector
+                vDSP_ztoc(&x->l_fftSplitTemp, 1, (DSPComplex *)x->l_R, 2, nfftO2);
+            }
+            
+            
+            /*for(i=0; i < p+1; i++) {
+             x->l_R[i] = 0.0;
+             for(j=0; j < length - i; j++) {
+             x->l_R[i] += x->l_winframe_buff[j] * x->l_winframe_buff[i+j];
+             //x->l_R[i] += x->l_win[j] * x->l_win[i+j];
+             }
+             }*/
+#ifdef DEBUG
+            for(i=0;i< p+1; i++) cpost("\nR(%d) = %f;",i+1,x->l_R[i]);
+#endif
+            
+            x->l_W[0] = x->l_R[1];
+            x->l_E[0] = x->l_R[0];
+            
+            for (i = 1; i <= p; i++) {
+                x->l_K[i] = x->l_W[i-1] / x->l_E[i-1];
+                
+                x->l_A[i][i] = x->l_K[i];
+                i1 = i - 1;
+                if (i1 >= 1) {
+                    for (j = 1; j <=i1; j++) {
+                        ji = i - j;
+                        x->l_A[j][i] = x->l_A[j][i1] - x->l_K[i] * x->l_A[ji][i1];
+                    }
+                }
+                
+                x->l_E[i] = x->l_E[i-1] * (1.0 - x->l_K[i] * x->l_K[i]);
+                
+                if (i != p) {
+                    x->l_W[i] = x->l_R[i+1];
+                    for (j = 1; j <= i; j++) {
+                        x->l_W[i] -= x->l_A[j][i] * x->l_R[i-j+1];
+                    }
+                }
+            }
+            
+            x->l_G = sqrt(x->l_E[p]);
+            for (i=0; i < p; i++) {
+                x->l_outCoeff_buff[i] = (float)(x->l_A[i+1][p]);
+                x->l_outParcor_buff[i] = (float)(x->l_K[i+1]);
+#ifdef DEBUG
+                //cpost("\nParcor(%d) = %g;",i+1,x->l_K[i+1]);
+                //cpost("\nCoeff(%d) = %g;",i+1,x->l_A[i+1][p]);
+#endif
+            }
+            
+            //--------------------------------------------------------------------------------
+            
+            //copy right side to left side, move delayed input to output
+            for (i=0; i < x->l_hop_size; i++) {
+                x->l_outError_buff[i] = x->l_frame_buff[i];
+                x->l_frame_buff[i] = x->l_frame_buff[i + x->l_hop_size];
+            }
+            
+            inframeidx = x->l_hop_size;
+            outframeidx = 0;
+            n++; //to avoid skipping a sample (since we already decremented
+            while (n--) {
+                x->l_frame_buff[inframeidx] = in[in_idx];
+                
+                out_gain[out_idx] = (float)(x->l_G);
+                out_error[out_idx] = x->l_outError_buff[outframeidx]; //for now
+                if (outframeidx < x->l_order) {
+                    out_coeff[out_idx] = x->l_outCoeff_buff[outframeidx];
+                    out_parcor[out_idx] = x->l_outParcor_buff[outframeidx];
+                    out_index[out_idx] = (float)(outframeidx + 1);
+                } else {
+                    out_coeff[out_idx] = 0.0;
+                    out_parcor[out_idx] = 0.0;
+                    out_index[out_idx] = 0;
+                }
+                
+                inframeidx++;
+                in_idx++;
+                outframeidx++;
+                out_idx++;
+            }
+            break;
+        }
+    }
+    
+    x->l_inframe_idx = inframeidx;
+    x->l_outframe_idx = outframeidx;
+}
+
+
+
 void lpc_dsp(t_lpc *x, t_signal **sp, short *count)
 {
 	if (sp[0]->s_n != x->l_v_size || sp[0]->s_sr != x->l_fs) {
@@ -310,6 +512,22 @@ void lpc_dsp(t_lpc *x, t_signal **sp, short *count)
 	
 	dsp_add(lpc_perform, 8, x, sp[0]->s_vec, sp[1]->s_vec, sp[2]->s_vec, sp[3]->s_vec, sp[4]->s_vec, sp[5]->s_vec, sp[0]->s_n);
 }
+
+
+void lpc_dsp64(t_lpc *x, t_object *dsp64, short *count, double samplerate,
+               long maxvectorsize, long flags)
+{
+    if (maxvectorsize != x->l_v_size || samplerate != x->l_fs) {
+        x->l_v_size = maxvectorsize;
+        x->l_fs = samplerate;
+        lpc_init(x);
+    }
+    
+    object_method(dsp64, gensym("dsp_add64"), x, lpc_perform64, 0, NULL);
+    
+}
+
+
 
 void lpc_assist(t_lpc *x, void *b, long msg, long arg, char *dst)
 {
@@ -352,7 +570,7 @@ void lpc_init(t_lpc *x) {
 	int i;
 	
 	if (x->l_fs < x->l_frame_rate * x->l_order) {
-		x->l_frame_rate = (long)(x->l_fs / x->l_order);
+		x->l_frame_rate = (x->l_fs / x->l_order);
 		error("mbc.lpc~: framerate * order must be less than or equal to sampling rate.  framerate has been changed to %d", x->l_frame_rate);
 	}
 	
@@ -514,7 +732,8 @@ void *lpc_new(long order, long framerate, long preemph)
 		framerate = DEFAULT_FRAMERATE;
 	}
 	
-	if (x = (t_lpc *)object_alloc(lpc_class)) {
+    x = (t_lpc *)object_alloc(lpc_class);
+	if (x) {
 		dsp_setup((t_pxobject *)x,1);
 		outlet_new((t_pxobject *)x, "signal");
 		outlet_new((t_pxobject *)x, "signal");

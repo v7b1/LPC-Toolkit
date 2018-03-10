@@ -38,11 +38,16 @@ void errfilt_order(t_errfilt *x, int order);
 void errfilt_init(t_errfilt *x);
 void errfilt_clear(t_errfilt *x);
 t_int *errfilt_perf_coeff(t_int *w);
+void errfilt_dsp64(t_errfilt *x, t_object *dsp64, short *count, double samplerate,
+                   long maxvectorsize, long flags);
+void errfilt_perf64_coeff(t_errfilt *x, t_object *dsp64, double **ins, long numins,
+                           double **outs, long numouts, long sampleframes, long flags, void *userparam);
+
 //////////////////////// global class pointer variable
 void *errfilt_class;
 
 
-int main(void)
+int C74_EXPORT main(void)
 {	
 	// object initialization, note the use of dsp_free for the freemethod, which is required
 	// unless you need to free allocated memory, in which case you should call dsp_free from
@@ -63,6 +68,7 @@ int main(void)
 	c = class_new("mbc.errfilt~", (method)errfilt_new, (method)errfilt_free, (long)sizeof(t_errfilt), 0L, A_DEFLONG, A_DEFFLOAT, 0);
 	
 	class_addmethod(c, (method)errfilt_dsp, "dsp", A_CANT, 0);
+    class_addmethod(c, (method)errfilt_dsp64, "dsp64", A_CANT, 0);
 	class_addmethod(c, (method)errfilt_interp,"interp",A_DEFFLOAT,0);
 	class_addmethod(c, (method)errfilt_order,"order",A_LONG,0);
 	class_addmethod(c, (method)errfilt_assist,"assist",A_CANT,0);
@@ -128,12 +134,72 @@ t_int *errfilt_perf_coeff(t_int *w)
 }
 
 
+void errfilt_perf64_coeff(t_errfilt *x, t_object *dsp64, double **ins, long numins,
+                          double **outs, long numouts, long sampleframes, long flags, void *userparam)
+{
+    t_double *in = ins[0];
+    t_double *coeffIn = ins[1];
+    t_double *coeffIdxIn = ins[2];
+    t_double *out = outs[0];
+    int n = (int)sampleframes;
+    int order = x->a_order;
+    int i, in_idx = 0, out_idx = 0;
+    t_float val = 0.0;
+    float sum = 0.0;
+    
+    while(n--) {
+        //get rid of NANs
+        if(IS_NAN_DOUBLE(coeffIn[in_idx])) coeffIn[in_idx] = 0.0;
+        in_idx++;
+    }
+    
+    in_idx = 0;
+    n = (int)sampleframes;
+    
+    //look at coefficient index, if not zeros, buffer in coefficients
+    while (n--) {
+        if ((int)(coeffIdxIn[in_idx]) > 0) {
+            x->a_bBuff[(int)(coeffIdxIn[in_idx])-1] = coeffIn[in_idx];
+            if ((int)(coeffIdxIn[in_idx]) == order) {
+                for(i = 0; i < order; i++) {
+                    x->a_b[i] = x->a_bBuff[i];
+                }
+            }
+        }
+        in_idx++;
+    }
+    
+    n = (int)sampleframes;
+    
+    while (n--) {
+        val = in[out_idx];
+        vDSP_vmul(x->a_b,1,x->a_x,1,x->a_tempVec,1,order);
+        vDSP_sve(x->a_tempVec,1,&sum,order);
+        val -= sum;
+        //for (i=0; i < order; i++) val -= x->a_b[i] * x->a_x[i];
+        for (i=order-1; i>0; i--) x->a_x[i] = x->a_x[i-1];
+        x->a_x[0] = in[out_idx];		
+        
+        out[out_idx] = val;
+        out_idx++;
+    }
+}
+
+
 void errfilt_init(t_errfilt *x) {
+    /*
 	x->a_b = (t_float *) getbytes16( MAX_ORDER * sizeof(t_float));
 	x->a_bBuff = (t_float *) getbytes( MAX_ORDER * sizeof(t_float));
 	x->a_x = (t_float *) getbytes16( MAX_ORDER * sizeof(t_float));
 	x->a_A = (t_float *) getbytes( MAX_ORDER * sizeof(t_float));
-	x->a_tempVec = (t_float *) getbytes16( MAX_ORDER * sizeof(t_float)); 
+	x->a_tempVec = (t_float *) getbytes16( MAX_ORDER * sizeof(t_float));
+    */
+    x->a_b = (t_float *) sysmem_newptr( MAX_ORDER * sizeof(t_float));
+    x->a_bBuff = (t_float *) sysmem_newptr( MAX_ORDER * sizeof(t_float));
+    x->a_x = (t_float *) sysmem_newptr( MAX_ORDER * sizeof(t_float));
+    x->a_A = (t_float *) sysmem_newptr( MAX_ORDER * sizeof(t_float));
+    x->a_tempVec = (t_float *) sysmem_newptr( MAX_ORDER * sizeof(t_float));
+    
 	errfilt_clear(x);
 }
 
@@ -179,6 +245,20 @@ void errfilt_dsp(t_errfilt *x, t_signal **sp, short *count)
 	dsp_add(errfilt_perf_coeff, 6, sp[0]->s_vec, sp[1]->s_vec, sp[2]->s_vec, x, sp[3]->s_vec, sp[0]->s_n);
 }
 
+void errfilt_dsp64(t_errfilt *x, t_object *dsp64, short *count, double samplerate,
+                   long maxvectorsize, long flags)
+{
+    // dsp_add
+    // 1: (t_perfroutine p) perform method
+    // 2: (long argc) number of args to your perform method
+    // 3...: argc additional arguments, all must be sizeof(pointer) or long
+    // these can be whatever, so you might want to include your object pointer in there
+    // so that you have access to the info, if you need it.
+    
+    object_method(dsp64, gensym("dsp_add64"), x, errfilt_perf64_coeff, 0, NULL);
+
+}
+
 void errfilt_assist(t_errfilt *x, void *b, long m, long a, char *s)
 {
 	if (m==ASSIST_INLET) {
@@ -195,11 +275,18 @@ void errfilt_assist(t_errfilt *x, void *b, long m, long a, char *s)
 
 void errfilt_free(t_errfilt *x) {
 	dsp_free((t_pxobject *) x);
+    /*
 	freebytes16((char *)x->a_b, MAX_ORDER * sizeof(t_float));
 	freebytes(x->a_bBuff, MAX_ORDER * sizeof(t_float));
 	freebytes16((char *)x->a_x, MAX_ORDER * sizeof(t_float));
 	freebytes(x->a_A, MAX_ORDER * sizeof(t_float));
 	freebytes16((char *)x->a_tempVec, MAX_ORDER * sizeof(t_float));
+     */
+    sysmem_freeptr(x->a_b);
+    sysmem_freeptr(x->a_bBuff);
+    sysmem_freeptr(x->a_x);
+    sysmem_freeptr(x->a_A);
+    sysmem_freeptr(x->a_tempVec);
 }
 
 void *errfilt_new(int order, float interp)
@@ -212,7 +299,7 @@ void *errfilt_new(int order, float interp)
 		return NULL;
 	}
 	
-	if (x = (t_errfilt *)object_alloc(errfilt_class)) 
+	if ((x = (t_errfilt *)object_alloc(errfilt_class)))
 	{
 		dsp_setup((t_pxobject *)x,3);
 		outlet_new(x, "signal");

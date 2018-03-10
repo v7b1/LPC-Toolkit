@@ -19,7 +19,7 @@ typedef struct _coeffDisp
 	t_atom* 					c_a;		//filter coefficients
 	long						c_len;			// length of filter coefficients
 	t_float* 					c_aBuff;	//filter coeff input buffer
-	long 						c_order;
+	int 						c_order;
 	int 						c_coeffType;//type of coeffecients: CT_FILTER,CT_AREA
 	int 						c_outMax;
 	void						*c_clock;
@@ -40,6 +40,13 @@ void coeffDisp_assist(t_coeffDisp *x, void *b, long m, long a, char *s);
 void coeffDisp_dsp(t_coeffDisp *x, t_signal **sp, short *count);
 t_int *coeffDisp_perf_filter(t_int *w);
 t_int *coeffDisp_perf_area(t_int *w);
+void coeffDisp_dsp64(t_coeffDisp *x, t_object *dsp64, short *count,
+                     double samplerate, long maxvectorsize, long flags);
+void coeffDisp_perf64_filter(t_coeffDisp *x, t_object *dsp64, double **ins,
+                         long numins, double **outs, long numouts, long sampleframes, long flags, void *userparam);
+void coeffDisp_perf64_area(t_coeffDisp *x, t_object *dsp64, double **ins,
+                             long numins, double **outs, long numouts, long sampleframes, long flags, void *userparam);
+
 void coeffDisp_order(t_coeffDisp *x, int order);
 void coeffDisp_tick(t_coeffDisp *x);
 void coeffDisp_init(t_coeffDisp *x);
@@ -48,7 +55,7 @@ void coeffDisp_clear(t_coeffDisp *x);
 void *coeffDisp_class;
 
 
-int main(void)
+int C74_EXPORT main(void)
 {	
 	// object initialization, note the use of dsp_free for the freemethod, which is required
 	// unless you need to free allocated memory, in which case you should call dsp_free from
@@ -69,6 +76,7 @@ int main(void)
 	c = class_new("mbc.coeffDisp~", (method)coeffDisp_new, (method)coeffDisp_free, (long)sizeof(t_coeffDisp), 0L, A_GIMME, 0);
 	
 	class_addmethod(c, (method)coeffDisp_dsp,		"dsp",		A_CANT, 0);
+    class_addmethod(c, (method)coeffDisp_dsp64,		"dsp64",		A_CANT, 0);
 	class_addmethod(c, (method)coeffDisp_assist,	"assist",	A_CANT, 0);
 	class_addmethod(c, (method)coeffDisp_order,		"order",	A_DEFLONG,0);
 	
@@ -160,6 +168,90 @@ t_int *coeffDisp_perf_area(t_int *w) //TODO: complete correctly (right now it's 
 	return (w+5);
 }
 
+
+void coeffDisp_perf64_filter(t_coeffDisp *x, t_object *dsp64, double **ins,
+                             long numins, double **outs, long numouts, long sampleframes, long flags, void *userparam)
+{
+    t_double *coeffIn = ins[0];
+    t_double *coeffIdxIn = ins[1];
+    t_double *G = ins[2];           // ???
+
+    int n = (int)sampleframes;
+    int order = x->c_order;
+    int outMax = x->c_outMax;
+    int i, in_idx = 0;
+    
+    while(n--) {
+        if(IS_NAN_DOUBLE(coeffIn[in_idx])) coeffIn[in_idx] = 0.0;
+        in_idx++;
+    }
+    
+    in_idx = 0;
+    n = (int)sampleframes;
+    
+    //look at coefficient index, if not zeros, buffer in coefficients
+    while (n--) {
+        if ((int)(coeffIdxIn[in_idx]) > 0) {
+            x->c_aBuff[(int)(coeffIdxIn[in_idx])-1] = coeffIn[in_idx];
+            if ((int)(coeffIdxIn[in_idx]) == order) {
+                (x->c_a[0]).a_type = A_FLOAT;
+                (x->c_a[0]).a_w.w_float = G[in_idx];
+                (x->c_a[outMax+1]).a_type = A_FLOAT;
+                (x->c_a[outMax+1]).a_w.w_float = 1.0;
+                for (i = 1; i < outMax; i++) {
+                    (x->c_a[i]).a_type = A_FLOAT;
+                    (x->c_a[i]).a_w.w_float = 0.0;
+                    (x->c_a[i+outMax+1]).a_type = A_FLOAT;
+                    (x->c_a[i+outMax+1]).a_w.w_float = -x->c_aBuff[i-1];
+                }
+                x->c_len = (outMax + 1) * 2;
+                clock_delay(x->c_clock, 0);
+                
+            }
+        }
+        in_idx++;
+    }
+}
+
+
+void coeffDisp_perf64_area(t_coeffDisp *x, t_object *dsp64, double **ins,
+                             long numins, double **outs, long numouts, long sampleframes, long flags, void *userparam)
+{
+    t_double *coeffIn = ins[0];
+    t_double *coeffIdxIn = ins[1];
+
+    int n = (int)sampleframes;
+    int order = x->c_order;
+    int i, in_idx = 0;
+    
+    while(n--) {
+        if(IS_NAN_DOUBLE(coeffIn[in_idx])) coeffIn[in_idx] = 0.0;
+        in_idx++;
+    }
+    
+    in_idx = 0;
+    n = (int)sampleframes;
+    
+    //look at coefficient index, if not zeros, buffer in coefficients
+    while (n--) {
+        if ((int)(coeffIdxIn[in_idx]) > 0) {
+            x->c_aBuff[(int)(coeffIdxIn[in_idx])-1] = coeffIn[in_idx];
+            if ((int)(coeffIdxIn[in_idx]) == order) {
+                for (i = 0; i < order; i++) {
+                    (x->c_a[i]).a_type = A_FLOAT;
+                    (x->c_a[i]).a_w.w_float = x->c_aBuff[i];
+                }
+                x->c_len = order;
+                clock_delay(x->c_clock, 0);
+            }
+        }
+        in_idx++;
+    }
+}
+
+
+
+
 void coeffDisp_tick(t_coeffDisp *x)
 {
 	if (x->c_len < (MAX_ORDER * 2)) {
@@ -208,6 +300,26 @@ void coeffDisp_dsp(t_coeffDisp *x, t_signal **sp, short *count)
 	
 	coeffDisp_clear(x);
 }
+
+void coeffDisp_dsp64(t_coeffDisp *x, t_object *dsp64, short *count,
+                     double samplerate, long maxvectorsize, long flags)
+{
+    switch (x->c_coeffType) {
+        case CT_FILTER:
+            object_method(dsp64, gensym("dsp_add64"), x, coeffDisp_perf64_filter, 0, NULL);
+            break;
+            
+        case CT_AREA:
+            object_method(dsp64, gensym("dsp_add64"), x, coeffDisp_perf64_area, 0, NULL);
+            break;
+            
+        default:
+            error("mbc.coeffDisp~: no coefficient type selected");
+    }
+    
+    coeffDisp_clear(x);
+}
+
 
 void coeffDisp_order(t_coeffDisp *x, int order) {
 	if (order < 1) {
@@ -259,8 +371,9 @@ void *coeffDisp_new(t_symbol *s, long argc, t_atom *argv)
 		error("mbc.coeffDisp~: must specify filter order (this should match mbc.lpc~)");
 		return NULL;
 	}
-
-	if (x = (t_coeffDisp *)object_alloc(coeffDisp_class)) {
+    
+    x = (t_coeffDisp *)object_alloc(coeffDisp_class);
+	if (x) {
 		dsp_setup((t_pxobject *)x,3);
 		x->c_out = listout(x);
 		

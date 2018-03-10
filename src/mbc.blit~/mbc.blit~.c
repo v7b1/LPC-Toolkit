@@ -51,6 +51,19 @@ t_int *blit_sigperf(t_int *w);		//signal frequency input - bandlimited
 t_int *blit_fltperf(t_int *w);		//float frequency input - bandlimited
 t_int *blit_sigperf_a(t_int *w);	//signal frequency input - aliased
 t_int *blit_fltperf_a(t_int *w);	//float frequency input - aliased
+
+void blit_dsp64(t_blit *x, t_object *dsp64, short *count, double samplerate,
+                 long maxvectorsize, long flags);
+void blit_sigperf64(t_blit *x, t_object *dsp64, double **ins, long numins,
+                     double **outs, long numouts, long sampleframes, long flags, void *userparam);
+void blit_fltperf64(t_blit *x, t_object *dsp64, double **ins, long numins,
+                    double **outs, long numouts, long sampleframes, long flags, void *userparam);
+void blit_sigperf64_a(t_blit *x, t_object *dsp64, double **ins, long numins,
+                    double **outs, long numouts, long sampleframes, long flags, void *userparam);
+void blit_fltperf64_a(t_blit *x, t_object *dsp64, double **ins, long numins,
+                    double **outs, long numouts, long sampleframes, long flags, void *userparam);
+
+
 void blit_float(t_blit *x, double f);
 void blit_int(t_blit *x, long n);
 void blit_sincGen(t_blit *x);
@@ -59,7 +72,7 @@ void blit_winGen(double *win, long N);
 void *blit_class;
 
 
-int main(void)
+int C74_EXPORT main(void)
 {	
 	// object initialization, note the use of dsp_free for the freemethod, which is required
 	// unless you need to free allocated memory, in which case you should call dsp_free from
@@ -82,6 +95,7 @@ int main(void)
 	class_addmethod(c, (method)blit_float,		"float",	A_FLOAT, 0);
 	class_addmethod(c, (method)blit_int, "int", A_LONG, 0);
 	class_addmethod(c, (method)blit_dsp,		"dsp",		A_CANT, 0);
+    class_addmethod(c, (method)blit_dsp64,		"dsp64",		A_CANT, 0);
 	class_addmethod(c, (method)blit_assist,	"assist",	A_CANT, 0);
 	
 	class_dspinit(c);				// new style object version of dsp_initclass();
@@ -150,12 +164,130 @@ t_int *blit_sigperf(t_int *w) {
 }
 
 
-t_int *blit_fltperf(t_int *w) {
-	int i;
 
-	t_blit *x = (t_blit *)(w[1]);
-	t_float *out = (t_float *)(w[2]);
-	int n = (int)(w[3]);
+void blit_sigperf64(t_blit *x, t_object *dsp64, double **ins, long numins,
+                    double **outs, long numouts, long sampleframes, long flags, void *userparam)
+{
+    int i;
+    
+    t_double *pinc = ins[0];
+    t_double *out = outs[0];
+    int n = (int)sampleframes;
+    double thresh = x->b_fs;
+    double phase = x->b_phase;
+    double phasen1 = phase;
+    long length = x->b_length;
+    int zcs = x->b_zcs;
+    double offset, step, idx, eta;
+    int P = x->b_P;
+    int PO2 = P / 2;
+    
+    while (n--) {
+        phase += *pinc;
+        if (phase >= thresh) {
+            offset = 1.0 - ((thresh - phasen1)/(phase - phasen1));
+            for (i = 0; i < PO2; i++) {
+                if (!(x->b_pulse[i].active)) {
+                    x->b_pulse[i].active = 1;
+                    x->b_pulse[i].phase = offset;
+                    break;
+                }
+            }
+            phase -= thresh;
+        }
+        phasen1 = phase;
+        
+        //render active pulses
+        *out = 0.0;
+        for (i = 0; i < PO2; i++) {
+            if (x->b_pulse[i].active) {
+                step = x->b_pulse[i].phase;
+                idx = step * zcs;
+                eta = idx - floor(idx);
+                idx = floor(idx);
+                *out += (((1.0 - eta) * x->b_sincTable[(long)(idx)] + eta * x->b_sincTable[((long)(idx + 1.0)) % length]) * 0.89); //linear interpolation, the 0.89 is a scaling factor to keep peak below 1 (and therefore no aliasing... good up to 20k
+                step += 1.0;
+                if (step > (float)(P-1)) {
+                    x->b_pulse[i].active = 0;
+                    x->b_pulse[i].phase = 0.0;
+                } else {
+                    x->b_pulse[i].phase = step;
+                }
+            }
+        }
+        out++;
+        pinc++;
+    }
+    
+    x->b_phase = phase;
+}
+
+
+t_int *blit_fltperf(t_int *w) {
+    int i;
+    
+    t_blit *x = (t_blit *)(w[1]);
+    t_float *out = (t_float *)(w[2]);
+    int n = (int)(w[3]);
+    float thresh = x->b_fs;
+    double phase = x->b_phase;
+    float phasen1 = phase;
+    float pinc = x->b_pinc;
+    long length = x->b_length;
+    int zcs = x->b_zcs;
+    float offset, step, idx, eta;
+    int P = x->b_P;
+    int PO2 = P / 2;
+    
+    while (n--) {
+        phase += pinc;
+        if (phase >= thresh) {
+            //find sub-sample offset
+            offset = 1.0 - ((thresh - phasen1)/(phase - phasen1));
+            for (i = 0; i < PO2; i++) {
+                if (!(x->b_pulse[i].active)) {
+                    x->b_pulse[i].active = 1;
+                    x->b_pulse[i].phase = offset;
+                    break;
+                }
+            }
+            phase -= thresh;
+        }
+        phasen1 = phase;
+        
+        //render active pulses
+        *out = 0.0;
+        for (i = 0; i < PO2; i++) {
+            if (x->b_pulse[i].active) {
+                step = x->b_pulse[i].phase;
+                idx = step * zcs;
+                eta = idx - floor(idx);
+                idx = floor(idx);
+                *out += (float)(((1.0 - eta) * x->b_sincTable[(long)(idx)] + eta * x->b_sincTable[((long)(idx + 1.0)) % length]) * 0.89); //linear interpolation, the 0.89 is a scaling factor to keep peak below 1 (and therefore no aliasing... good up to 20k
+                step += 1.0;
+                if (step > (float)(P-1)) {
+                    x->b_pulse[i].active = 0;
+                    x->b_pulse[i].phase = 0.0;
+                } else {
+                    x->b_pulse[i].phase = step;
+                }
+            }
+        }
+        out++;
+    }
+    
+    x->b_phase = phase;
+    
+    return (w+4);
+}
+
+
+void blit_fltperf64(t_blit *x, t_object *dsp64, double **ins, long numins,
+                    double **outs, long numouts, long sampleframes, long flags, void *userparam)
+{
+	int i;
+	t_double *out = outs[0];
+	int n = (int)sampleframes;
 	float thresh = x->b_fs;
 	double phase = x->b_phase;
 	float phasen1 = phase;
@@ -190,7 +322,7 @@ t_int *blit_fltperf(t_int *w) {
 				idx = step * zcs;
 				eta = idx - floor(idx);
 				idx = floor(idx);
-				*out += (float)(((1.0 - eta) * x->b_sincTable[(long)(idx)] + eta * x->b_sincTable[((long)(idx + 1.0)) % length]) * 0.89); //linear interpolation, the 0.89 is a scaling factor to keep peak below 1 (and therefore no aliasing... good up to 20k
+				*out += (((1.0 - eta) * x->b_sincTable[(long)(idx)] + eta * x->b_sincTable[((long)(idx + 1.0)) % length]) * 0.89); //linear interpolation, the 0.89 is a scaling factor to keep peak below 1 (and therefore no aliasing... good up to 20k
 				step += 1.0;
 				if (step > (float)(P-1)) {
 					x->b_pulse[i].active = 0;
@@ -205,14 +337,42 @@ t_int *blit_fltperf(t_int *w) {
 	
 	x->b_phase = phase;
 	
-	return (w+4);
 }
 
+
 t_int *blit_sigperf_a(t_int *w) {
-	t_float *pinc = (t_float *)(w[1]);
-	t_blit *x = (t_blit *)(w[2]);
-	t_float *out = (t_float *)(w[3]);
-	int n = (int)(w[4]);
+    t_float *pinc = (t_float *)(w[1]);
+    t_blit *x = (t_blit *)(w[2]);
+    t_float *out = (t_float *)(w[3]);
+    int n = (int)(w[4]);
+    float thresh = x->b_fs;
+    double phase = x->b_phase;
+    
+    while (n--) {
+        phase += *pinc;
+        if (phase >= thresh) {
+            *out = 1.0;
+            phase -= thresh;
+        } else {
+            *out = 0.0;
+        }
+        
+        out++;
+        pinc++;
+    }
+    
+    x->b_phase = phase;
+    
+    return (w+5);
+}
+
+
+void blit_sigperf64_a(t_blit *x, t_object *dsp64, double **ins, long numins,
+                      double **outs, long numouts, long sampleframes, long flags, void *userparam)
+{
+	t_double *pinc = ins[0];
+	t_double *out = outs[0];
+	int n = (int)sampleframes;
 	float thresh = x->b_fs;
 	double phase = x->b_phase;
 		
@@ -230,8 +390,7 @@ t_int *blit_sigperf_a(t_int *w) {
 	}
 	
 	x->b_phase = phase;
-	
-	return (w+5);
+
 }
 
 
@@ -259,6 +418,32 @@ t_int *blit_fltperf_a(t_int *w) {
 	
 	return (w+4);
 }
+
+void blit_fltperf64_a(t_blit *x, t_object *dsp64, double **ins, long numins,
+                      double **outs, long numouts, long sampleframes, long flags, void *userparam)
+{
+    t_double *out = outs[0];
+    int n = sampleframes;
+    double thresh = x->b_fs;
+    double phase = x->b_phase;
+    double pinc = x->b_pinc;
+    
+    while (n--) {
+        phase += pinc;
+        if (phase >= thresh) {
+            *out = 1.0;
+            phase -= thresh;
+        } else {
+            *out = 0.0;
+        }
+        
+        out++;
+    }
+    
+    x->b_phase = phase;
+    
+}
+
 
 void blit_sincGen(t_blit *x) {
 	int i;
@@ -322,6 +507,27 @@ void blit_dsp(t_blit *x, t_signal **sp, short *count)
 	
 }
 
+void blit_dsp64(t_blit *x, t_object *dsp64, short *count, double samplerate,
+                long maxvectorsize, long flags)
+{
+    x->b_fs = sys_getsr();
+    x->b_phase = 0;
+    
+    if (count[0]) { // perform signal based frequency update
+        if (x->b_bandlimit)
+            object_method(dsp64, gensym("dsp_add64"), x, blit_sigperf64, 0, NULL);
+        else
+            object_method(dsp64, gensym("dsp_add64"), x, blit_sigperf64_a, 0, NULL);
+    } else { //perform interrupt based frequency update
+        if (x->b_bandlimit)
+            object_method(dsp64, gensym("dsp_add64"), x, blit_fltperf64, 0, NULL);
+        else
+            object_method(dsp64, gensym("dsp_add64"), x, blit_fltperf64_a, 0, NULL);
+        
+    }
+    
+}
+
 void blit_float(t_blit *x, double f)
 {
     x->b_pinc = (float)f;
@@ -362,7 +568,8 @@ void *blit_new(t_symbol *s, long argc, t_atom *argv)
 {
 	t_blit *x = NULL;
 
-	if (x = (t_blit *)object_alloc(blit_class)) {
+    x = (t_blit *)object_alloc(blit_class);
+	if (x) {
 		dsp_setup((t_pxobject *)x,1);
 		outlet_new((t_pxobject *)x, "signal");
 		

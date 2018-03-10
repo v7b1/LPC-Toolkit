@@ -66,6 +66,10 @@ void pitch_assist(t_pitch *x, void *b, long m, long a, char *s);
 
 void pitch_dsp(t_pitch *x, t_signal **sp, short *count);
 t_int *pitch_perform(t_int *w);
+void pitch_dsp64(t_pitch *x, t_object *dsp64, short *count, double samplerate,
+                   long maxvectorsize, long flags);
+void pitch_perform64(t_pitch *x, t_object *dsp64, double **ins, long numins,
+                           double **outs, long numouts, long sampleframes, long flags, void *userparam);
 void pitch_init(t_pitch *x);
 void pitch_thresh(t_pitch *x, double thresh);
 void pitch_frame_rate(t_pitch *x, double thresh);
@@ -74,7 +78,7 @@ void pitch_frame_rate(t_pitch *x, double thresh);
 void *pitch_class;
 
 
-int main(void)
+int C74_EXPORT main(void)
 {	
 	// object initialization, note the use of dsp_free for the freemethod, which is required
 	// unless you need to free allocated memory, in which case you should call dsp_free from
@@ -95,6 +99,7 @@ int main(void)
 	c = class_new("mbc.pitch~", (method)pitch_new, (method)pitch_free, (long)sizeof(t_pitch), 0L, A_GIMME, 0);
 	
 	class_addmethod(c, (method)pitch_dsp,		"dsp",		A_CANT, 0);
+    class_addmethod(c, (method)pitch_dsp64,		"dsp64",		A_CANT, 0);
 	class_addmethod(c, (method)pitch_assist,	"assist",	A_CANT, 0);
 	class_addmethod(c, (method)pitch_thresh,		"thresh",	A_FLOAT,0);
 	class_addmethod(c, (method)pitch_frame_rate,	"frame_rate",A_FLOAT,0);
@@ -270,6 +275,172 @@ void pitch_dsp(t_pitch *x, t_signal **sp, short *count)
 	dsp_add(pitch_perform, 3, sp[0]->s_vec, x, sp[0]->s_n);
 }
 
+
+void pitch_dsp64(t_pitch *x, t_object *dsp64, short *count, double samplerate,
+                 long maxvectorsize, long flags)
+{
+    if (maxvectorsize != x->p_v_size || samplerate != x->p_fs) {
+        x->p_v_size = maxvectorsize;
+        x->p_fs = samplerate;
+        pitch_init(x);
+    }
+    
+    object_method(dsp64, gensym("dsp_add64"), x, pitch_perform64, 0, NULL);
+}
+
+void pitch_perform64(t_pitch *x, t_object *dsp64, double **ins, long numins,
+                     double **outs, long numouts, long sampleframes, long flags, void *userparam)
+{
+    t_double *in = ins[0];
+    int n = (int)sampleframes;
+    int length = x->p_frame_size;
+    int hop_size = x->p_hop_size;
+    int log2nfft = NLOG2(2*length);
+    int nfft = POW2(log2nfft);
+    int nfftO2 = nfft/2;
+    float recipn = 1.0/nfft;
+    int inframeidx = x->p_inframe_idx;
+    int hopidx = x->p_hop_idx;
+    float thresh = x->p_thresh;
+    int overlap = x->p_overlap;
+    float fs = x->p_fs;
+    int i,j;
+    float a,b,c,p,na,nb,nc,np;
+    int in_idx = 0;
+    float scale,sum;
+    
+    while (n--) {
+        if (hopidx < hop_size) {
+            hopidx++;
+            in_idx++;
+        } else {
+            if (inframeidx < length) {
+                //copy input into frame buff
+                x->p_padframe_buff[inframeidx] = in[in_idx];
+                
+                inframeidx++;
+                in_idx++;
+            } else {
+                //Step 1. Calculate Difference Function--------------------------------------------
+                //1A) Autocorrelation via FFT------------------------------------------------------
+                
+                // zero pad
+                vDSP_vclr(x->p_padframe_buff+length,1,nfft-length);
+                //conver to split complex vector
+                vDSP_ctoz( ( DSPComplex * ) x->p_padframe_buff, 2, &x->p_fftSplitTemp, 1, nfftO2);
+                //perform forward in place fft
+                vDSP_fft_zrip(x->p_fftsetup, &x->p_fftSplitTemp, 1, log2nfft, FFT_FORWARD);
+                //scaling
+                scale = 0.5;
+                vDSP_vsmul(x->p_fftSplitTemp.realp,1,&scale,x->p_fftSplitTemp.realp,1,nfftO2);
+                vDSP_vsmul(x->p_fftSplitTemp.imagp,1,&scale,x->p_fftSplitTemp.imagp,1,nfftO2);
+                //compute PSD
+                vDSP_zvmags(&x->p_fftSplitTemp,1,x->p_fftSplitTemp.realp,1,nfftO2);
+                //clear imaginary part
+                vDSP_vclr(x->p_fftSplitTemp.imagp,1,nfftO2);
+                //perform inverse in place fft
+                vDSP_fft_zrip(x->p_fftsetup, &x->p_fftSplitTemp, 1, log2nfft, FFT_INVERSE);
+                //scaling
+                vDSP_vsmul(x->p_fftSplitTemp.realp,1,&recipn,x->p_fftSplitTemp.realp,1,nfftO2);
+                vDSP_vsmul(x->p_fftSplitTemp.imagp,1,&recipn,x->p_fftSplitTemp.imagp,1,nfftO2);
+                //convert back to real number vector
+                vDSP_ztoc(&x->p_fftSplitTemp, 1, (DSPComplex *)x->p_R, 2, nfftO2);
+                
+                //1B) Calculate M via recursion------------------------------------------------------
+                x->p_M[0] = 2*x->p_R[0];
+                for (i=1;i<length;i++) {
+                    x->p_M[i] = x->p_M[i-1] - (x->p_padframe_buff[length-i] * x->p_padframe_buff[length-i] + x->p_padframe_buff[i-1] * x->p_padframe_buff[i-1]);
+                }
+                
+                //1C) Calculate D via M and R (D=M-2*R)----------------------------------------------
+                //vDSP_vsub(x->p_M,1,x->p_R,1,x->p_D,1,length);
+                //vDSP_vsub(x->p_D,1,x->p_R,1,x->p_D,1,length);
+                for (i=0;i<length;i++) {
+                    x->p_D[i] = x->p_M[i] - x->p_R[i] - x->p_R[i];
+                }
+                
+                //Step 2. -  Calculate cumulative mean norm difference function
+                //dp = d/runningaverage(d)
+                /*a = 1.0;
+                 b = 1.0;
+                 vDSP_vramp(&a,&b,x->p_tempVec,1,length);
+                 vDSP_vavlin(x->p_D,1,x->p_tempVec,x->p_Dp,1,length);
+                 vDSP_vdiv(x->p_D,1,x->p_Dp,1,x->p_Dp,1,length);
+                 x->p_Dp[0] = 1.0;*/
+                for (i=1;i<length;i++) {
+                    sum = 0.0;
+                    for (j=0;j<i;j++) {
+                        sum += x->p_D[j];
+                    }
+                    sum = sum/i;
+                    x->p_Dp[i] = x->p_D[i]/sum;
+                }
+                x->p_Dp[0] = 1.0;
+                
+                //Step 3. find first (smallest) tau that is a local minimum below threshold-----------
+                for (i=1;i<length;i++){
+                    if (x->p_Dp[i] < thresh) {
+                        if(x->p_Dp[i-1] > x->p_Dp[i]) {
+                            if(x->p_Dp[i] < x->p_Dp[i+1]) {
+                                //Step 4. - perform parabolic interpolation---------------------------
+                                a=x->p_Dp[i-1];
+                                b=x->p_Dp[i];
+                                c=x->p_Dp[i+1];
+                                p = 0.5*(c - a)/(2*b - a - c);
+                                x->p_freq = fs/(i+p);
+                                //x->p_min = b - 0.25*(a - c)*p;
+                                
+                                //NOTE: I probably don't need to do interpolation on this part...
+                                na=2*x->p_R[i-1]/x->p_M[i-1];
+                                nb=2*x->p_R[i]/x->p_M[i];
+                                nc=2*x->p_R[i+1]/x->p_M[i+1];
+                                np = 0.5*(nc - na)/(2*nb - na - nc);
+                                x->p_clarity = nb - 0.25*(na - nc)*np;
+                                //x->p_clarity = nb;
+                                
+                                outlet_float(x->p_freqOut,x->p_freq);
+                                outlet_float(x->p_clarityOut,x->p_clarity);
+                                break; 
+                            }
+                        }
+                    }
+                }
+                
+                //copy right side to left side, move delayed input to output, this only works for 50% OL, change if we want more
+                if (overlap > 0) {
+                    for (i=0; i < overlap; i++) {
+                        x->p_padframe_buff[i] = x->p_padframe_buff[i + x->p_hop_size];
+                    }
+                    inframeidx = overlap;
+                } else {
+                    inframeidx = 0;
+                }
+                //hopidx = 0;
+                hopidx = length;
+                
+                n++; //to avoid skipping a sample (since we already decremented
+                while (n--) {
+                    if (hopidx < hop_size) {
+                        hopidx++;
+                        in_idx++;
+                    } else {
+                        //copy input into frame buff
+                        x->p_padframe_buff[inframeidx] = in[in_idx];
+                        
+                        inframeidx++;
+                        in_idx++;
+                    }
+                }
+                break;
+            }
+        }
+    }
+    
+    x->p_inframe_idx = inframeidx;
+    x->p_hop_idx = hopidx;
+}
+
+
 void pitch_assist(t_pitch *x, void *b, long msg, long arg, char *dst)
 {
 	if (msg==ASSIST_INLET) {
@@ -387,7 +558,8 @@ void *pitch_new(t_symbol *s, long argc, t_atom *argv)
 {
 	t_pitch *x = NULL;
 
-	if (x = (t_pitch *)object_alloc(pitch_class)) {
+    x = (t_pitch *)object_alloc(pitch_class);
+	if (x) {
 		dsp_setup((t_pxobject *)x,1);
 		x->p_clarityOut = floatout(x);
 		x->p_freqOut = floatout(x);

@@ -1,4 +1,4 @@
-// Xcode target configuration settings for the Max 5 SDK
+// Xcode target configuration settings for the Max 6 SDK
 // Used as the basis for Xcode projects to build Max externals.
 //
 // Changes to the settings in this file will be applied to all SDK examples
@@ -6,17 +6,18 @@
 // Xcode's target inspector.
 //
 // by Timothy Place
-// Copyright © 2008, Cycling '74
+// Copyright © 2012, Cycling '74
 
 
 // Name & Version
 PRODUCT_NAME = $(PROJECT_NAME)
-PRODUCT_VERSION = 5.1.1
+PRODUCT_VERSION = 7.0.1
+ARCHS = i386 x86_64
 
 
 // Paths
-C74SUPPORT = $(SRCROOT)/../../c74support
-HEADER_SEARCH_PATHS = /Developer/Headers/FlatCarbon "$(C74SUPPORT)/max-includes" "$(C74SUPPORT)/msp-includes" "$(C74SUPPORT)/jit-includes"
+C74SUPPORT = $(SRCROOT)/../../../c74support
+HEADER_SEARCH_PATHS = "$(C74SUPPORT)/max-includes" "$(C74SUPPORT)/msp-includes" "$(C74SUPPORT)/jit-includes"
 FRAMEWORK_SEARCH_PATHS = "$(C74SUPPORT)/max-includes" "$(C74SUPPORT)/msp-includes" "$(C74SUPPORT)/jit-includes"
 DSTROOT = $(SRCROOT)/../../sdk-build
 // (This next path is relative to DSTROOT)
@@ -28,15 +29,27 @@ GCC_PREFIX_HEADER = $(C74SUPPORT)/max-includes/macho-prefix.pch
 INFOPLIST_FILE = $(SRCROOT)/../Info.plist
 
 
-// Per architecture and deployment settings
-SDKROOT = /Developer/SDKs/MacOSX10.4u.sdk
+// Architecture and Deployment
+ARCHS = i386 x86_64
 
-GCC_VERSION = 4.0
-// The above line can be specialized as follows provided you are using Xcode 3 or higher
-//	GCC_VERSION[arch=i386] = 4.0
-//	GCC_VERSION[arch=ppc] = 4.0
+// The following section sets the Mac SDK version to be used.
+// For most projects this has little to no impact because there are no direct dependencies on OS function calls.
+// In those projects with OS function calls, it should be okay to use the most recent SDK version because the 
+// MACOSX_DEPLOYMENT_TARGET will disable functionality that is unavailable in the older target OS.
+// For this reason, the SDKROOT variable is commented out, telling Xcode to use the default (which is the most recent SDK).
+//
+// SDKROOT = macosx10.6
 
-MACOSX_DEPLOYMENT_TARGET = 10.4
+MACOSX_DEPLOYMENT_TARGET = 10.7
+
+
+// Compiler Version -- leave them all commented out to get the default version provided by Xcode
+// GCC_VERSION = com.apple.compilers.llvmgcc42
+// GCC_VERSION = com.apple.compilers.llvm.clang.1_0
+
+
+// Preprocessor Defines
+GCC_PREPROCESSOR_DEFINITIONS = "DENORM_WANT_FIX = 1" "NO_TRANSLATION_SUPPORT = 1"
 
 
 // Static Configuration (don't change these)
@@ -44,3 +57,15 @@ WRAPPER_EXTENSION = mxo;
 WARNING_CFLAGS = -Wmost -Wno-four-char-constants -Wno-unknown-pragmas
 DEPLOYMENT_LOCATION = YES
 GENERATE_PKGINFO_FILE = YES
+
+
+// Flags to enforce some build-time checks for the symbols used while not actually performing a hard link
+C74_SYM_LINKER_FLAGS = @$(C74SUPPORT)/max-includes/c74_linker_flags.txt
+
+
+// hide all symbols by default
+// mark a function to be exported with the C74_EXPORT macro
+// most likely this will only apply to the ext_main() function which we've already prototyped for you
+OTHER_CFLAGS = -fvisibility=hidden
+
+OTHER_LDFLAGS = -framework MaxAudioAPI -framework JitterAPI $(C74_SYM_LINKER_FLAGS)
